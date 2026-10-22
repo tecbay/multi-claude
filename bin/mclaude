@@ -9,7 +9,8 @@
 
 set -u
 
-VERSION="0.2.0"
+VERSION="0.2.1"
+ICON_VERSION="2"  # bump when the icon design changes; older apps get rebuilt
 ROOT="${MCLAUDE_HOME:-$HOME/.multi-claude}"
 DESKTOP_DIR="$ROOT/desktop"
 CODE_DIR="$ROOT/code"
@@ -317,6 +318,7 @@ LAUNCHER
     touch "$app"
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
         -f "$app" >/dev/null 2>&1 || true
+    printf '%s' "$ICON_VERSION" > "$app/Contents/Resources/.mclaude-icon"
     ok "Dock app: $app ($(profile_color "$slug"))"
 }
 
@@ -457,10 +459,27 @@ cmd_rm() {
     ok "removed $slug"
 }
 
-cmd_app() {  # (re)create the Dock app for an existing profile
+cmd_app() {  # (re)create the Dock app for one profile, or --all
     local slug
+    if [ "${1:-}" = "--all" ]; then
+        for slug in $(list_slugs); do make_app "$slug"; done
+        return 0
+    fi
     slug=$(profile_arg "${1:-}" "Rebuild the Dock app for which profile?") || exit 1
     make_app "$slug"
+}
+
+# Rebuild Dock apps made by an older mclaude so they pick up the current icon.
+# Only touches profiles that already have an app; cheap no-op when all are current.
+upgrade_apps() {
+    local slug app
+    for slug in $(list_slugs); do
+        app=$(app_path "$slug")
+        [ -d "$app" ] || continue
+        [ "$(cat "$app/Contents/Resources/.mclaude-icon" 2>/dev/null)" = "$ICON_VERSION" ] && continue
+        printf '%sUpdating icon for %s…%s\n' "$DIM" "$(display_name "$slug")" "$X" >&2
+        make_app "$slug" >/dev/null
+    done
 }
 
 cmd_alias() {  # print shell aliases: eval "$(mclaude alias)"
@@ -524,7 +543,7 @@ ${B}Usage${X}
   mclaude focus <name>            bring a running instance to the front
   mclaude code <name> [args...]   run Claude Code as that account
   mclaude quit <name> [--force]   quit an instance (--force kills its process tree)
-  mclaude app <name>              (re)create the Dock app for a profile
+  mclaude app <name>|--all        rebuild the Dock app (icon) for one or all profiles
   mclaude alias                   print claude-<name> aliases; eval "\$(mclaude alias)"
   mclaude path <name>             show a profile's folders
   mclaude rm <name>               delete a profile and its logins (asks for DELETE)
@@ -539,6 +558,11 @@ EOF
 main() {
     local cmd="${1:-}"
     [ $# -gt 0 ] && shift
+    # Skip for quick/read-only commands (alias runs at every shell start).
+    case "$cmd" in
+        alias|path|colors|colours|app|rm|remove|help|-h|--help|-v|--version) ;;
+        *) upgrade_apps ;;
+    esac
     if [ -z "$cmd" ]; then
         if interactive; then cmd_menu; else usage; fi
         return

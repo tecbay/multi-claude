@@ -77,7 +77,8 @@ Prefer typing? Every menu item is also a command. If you leave out the name or c
 - **Claude Code shortcuts:** if you said yes during install, type `claude-work` to run Claude Code as Work.
 - **Login opens in the wrong window?** On the login page, choose the option to copy a code and paste it into the right window. You only need to do this once per profile.
 - **Where does the colour show?** On the profile's app icon: in Applications, Spotlight, Launchpad, and the Dock if you drag it there. Once Claude is open, the running window uses the normal Claude icon. macOS doesn't let another app change that.
-- **Still seeing the old icon?** macOS caches icons. Run `killall Dock`, or `mclaude app <name>` to rebuild it.
+- **Updating?** Run `git pull` in the repo folder. Profiles you already made keep their logins, and their icons update the next time you run `mclaude`.
+- **Still seeing the old icon?** macOS caches icons. Run `killall Dock`, or `mclaude app --all` to rebuild every icon.
 - **Which window is which?** Every running copy is named "Claude". Run `mclaude open <name>` to bring a specific one to the front.
 
 ## Is it safe?
