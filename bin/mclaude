@@ -1,0 +1,406 @@
+#!/bin/bash
+# mclaude — run multiple Claude accounts side by side (Claude Desktop + Claude Code).
+#
+# Each profile gets its own data folder, so each account stays signed in:
+#   Desktop: Claude.app launched with --user-data-dir=<folder>
+#   Code:    claude CLI run with CLAUDE_CONFIG_DIR=<folder>
+#
+# macOS built-ins only; bash 3.2 compatible (no declare -A, mapfile, ${var,,}).
+
+set -u
+
+VERSION="0.1.0"
+ROOT="${MCLAUDE_HOME:-$HOME/.multi-claude}"
+DESKTOP_DIR="$ROOT/desktop"
+CODE_DIR="$ROOT/code"
+APPS_DIR="${MCLAUDE_APPS_DIR:-$HOME/Applications}"
+BUNDLE_ID_PREFIX="local.multi-claude"
+
+# Resolve our real location (bin/mclaude is usually symlinked onto PATH).
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    t=$(readlink "$SELF")
+    case "$t" in /*) SELF="$t" ;; *) SELF="$(dirname "$SELF")/$t" ;; esac
+done
+LIB_DIR="$(cd "$(dirname "$SELF")/../lib" 2>/dev/null && pwd)"
+
+COLORS="red orange yellow green teal blue indigo purple pink gray black"
+
+if [ -t 1 ]; then
+    B=$'\033[1m'; DIM=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; X=$'\033[0m'
+else
+    B=""; DIM=""; G=""; R=""; Y=""; X=""
+fi
+
+err() { printf '%smclaude:%s %s\n' "$R" "$X" "$*" >&2; }
+die() { err "$*"; exit 1; }
+ok()  { printf '%s✓%s %s\n' "$G" "$X" "$*"; }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-'; }
+
+need_slug() {
+    local slug
+    slug=$(slugify "${1:-}")
+    [ -n "$slug" ] || die "profile name must contain a letter or number"
+    printf '%s' "$slug"
+}
+
+profile_exists() { [ -d "$DESKTOP_DIR/$1" ] || [ -d "$CODE_DIR/$1" ]; }
+
+need_profile() {
+    profile_exists "$1" || die "no profile '$1' (see: mclaude ls)"
+}
+
+display_name() {  # stored at create time so "Client X" survives slugging
+    local f="$ROOT/.names/$1"
+    if [ -f "$f" ]; then cat "$f"; else printf '%s' "$1"; fi
+}
+
+app_path() { printf '%s/Claude %s.app' "$APPS_DIR" "$(display_name "$1")"; }
+
+# Named colour or #RRGGBB → RRGGBB (empty if invalid).
+color_hex() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        red) echo E5484D ;;    orange) echo F76B15 ;; yellow) echo FFB224 ;;
+        green) echo 30A46C ;;  teal) echo 12A594 ;;   blue) echo 0090FF ;;
+        indigo) echo 3E63DD ;; purple) echo 8E4EC6 ;; pink) echo D6409F ;;
+        gray|grey) echo 8B8D98 ;; black) echo 1C2024 ;;
+        *)  local h="${1#\#}"
+            printf '%s' "$h" | grep -Eq '^[0-9A-Fa-f]{6}$' && printf '%s\n' "$h" | tr '[:lower:]' '[:upper:]' ;;
+    esac
+}
+
+# Saved colour, or a stable default picked from the slug.
+profile_color() {
+    local f="$ROOT/.colors/$1" n
+    if [ -f "$f" ]; then cat "$f"; return; fi
+    n=$(printf '%s' "$1" | cksum | awk '{print $1 % 11 + 1}')
+    printf '%s' "$COLORS" | awk -v n="$n" '{print $n}'
+}
+
+need_color() {
+    [ -n "$(color_hex "${1:-}")" ] || die "unknown colour '${1:-}' — use one of: $COLORS, or #RRGGBB"
+}
+
+detect_claude_app() {
+    local c
+    for c in "/Applications/Claude.app" "$HOME/Applications/Claude.app"; do
+        [ -d "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+# Main PID of a Desktop instance. Matches --user-data-dir=<dir> as a COMPLETE
+# argv value (next char is a space or end of line), so "work" never matches "work2".
+main_pid() {
+    local procs
+    # Snapshot ps BEFORE awk starts, and pass the needle via env, so the
+    # matcher never sees (and matches) its own command line.
+    procs=$(ps axo pid=,command=)
+    printf '%s\n' "$procs" | MC_WANT="--user-data-dir=$DESKTOP_DIR/$1" awk '
+        BEGIN { want = ENVIRON["MC_WANT"] }
+        {
+            i = index($0, want)
+            if (i == 0) next
+            rest = substr($0, i + length(want), 1)
+            if (rest == "" || rest == " ") { print $1; exit }
+        }'
+}
+
+# All PIDs in the tree under a pid (Electron helpers don't carry the flag).
+tree_pids() {
+    local pids="$1" frontier="$1" next p
+    while [ -n "$frontier" ]; do
+        next=""
+        for p in $frontier; do
+            next="$next $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
+        done
+        next=$(printf '%s' "$next" | xargs)
+        [ -n "$next" ] && pids="$pids $next"
+        frontier="$next"
+    done
+    printf '%s' "$pids"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_new() {
+    local name="" with_app=1 color=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-app) with_app=0 ;;
+            --color|--colour|-c) color="${2:-}"; need_color "$color"; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) name="${name:+$name }$1" ;;
+        esac
+        shift
+    done
+    [ -n "$name" ] || die "usage: mclaude new <Name> [--color <colour>] [--no-app]"
+    name=$(printf '%s' "$name" | tr -d '"\\{}:<>&/' | sed 's/^ *//;s/ *$//')
+    local slug
+    slug=$(need_slug "$name")
+    [ "$slug" = "default" ] && die "'default' is reserved — pick another name"
+    profile_exists "$slug" && die "profile '$slug' already exists"
+
+    mkdir -p "$DESKTOP_DIR/$slug" "$CODE_DIR/$slug" "$ROOT/.names"
+    printf '%s' "$name" > "$ROOT/.names/$slug"
+    if [ -n "$color" ]; then
+        mkdir -p "$ROOT/.colors"
+        printf '%s' "$color" > "$ROOT/.colors/$slug"
+    fi
+    ok "created profile ${B}$slug${X}"
+
+    [ "$with_app" -eq 1 ] && make_app "$slug"
+
+    printf '\n  Desktop:  mclaude open %s\n  Code:     mclaude code %s\n\n' "$slug" "$slug"
+    printf '%sSign in once in each; it stays signed in.%s\n' "$DIM" "$X"
+}
+
+# Writes a tiny wrapper .app so the profile shows up in Dock / Spotlight / Launchpad.
+make_app() {
+    local slug="$1" claude_app app
+    claude_app=$(detect_claude_app) || { err "Claude.app not found — skipped Dock app"; return 0; }
+    app=$(app_path "$slug")
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+    cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key><string>Claude $(display_name "$slug")</string>
+	<key>CFBundleIdentifier</key><string>$BUNDLE_ID_PREFIX.$slug</string>
+	<key>CFBundleExecutable</key><string>launcher</string>
+	<key>CFBundleIconFile</key><string>app</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleVersion</key><string>1.0</string>
+	<key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+
+    cat > "$app/Contents/MacOS/launcher" <<LAUNCHER
+#!/bin/bash
+exec /usr/bin/open -n -a "$claude_app" --args --user-data-dir="$DESKTOP_DIR/$slug"
+LAUNCHER
+    chmod +x "$app/Contents/MacOS/launcher"
+
+    local icns
+    icns=$(ls "$claude_app/Contents/Resources/"*.icns 2>/dev/null | head -n 1)
+    if [ -n "$icns" ]; then
+        badge_icon "$slug" "$icns" "$app/Contents/Resources/app.icns" \
+            || cp "$icns" "$app/Contents/Resources/app.icns"
+    fi
+    touch "$app"
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f "$app" >/dev/null 2>&1 || true
+    ok "Dock app: $app ($(profile_color "$slug"))"
+}
+
+# Claude's icon + a coloured disc with the profile's initial → .icns
+badge_icon() {
+    local slug="$1" src="$2" dest="$3" hex letter tmp s
+    [ -f "$LIB_DIR/badge.js" ] || return 1
+    hex=$(color_hex "$(profile_color "$slug")")
+    letter=$(display_name "$slug" | cut -c1 | tr '[:lower:]' '[:upper:]')
+    tmp=$(mktemp -d) || return 1
+    mkdir -p "$tmp/i.iconset"
+    if /usr/bin/osascript -l JavaScript "$LIB_DIR/badge.js" "$src" "$tmp/b.png" "$hex" "$letter" >/dev/null 2>&1; then
+        for s in 16 32 128 256 512; do
+            sips -z "$s" "$s" "$tmp/b.png" --out "$tmp/i.iconset/icon_${s}x${s}.png" >/dev/null 2>&1
+            sips -z $((s * 2)) $((s * 2)) "$tmp/b.png" --out "$tmp/i.iconset/icon_${s}x${s}@2x.png" >/dev/null 2>&1
+        done
+        rm -f "$dest"
+        iconutil -c icns "$tmp/i.iconset" -o "$dest" 2>/dev/null
+    else
+        rm -f "$dest"
+    fi
+    rm -rf "${tmp:?}"
+    [ -s "$dest" ]
+}
+
+cmd_color() {  # change a profile's icon colour
+    local slug color
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    color="${2:-}"
+    [ -n "$color" ] || die "usage: mclaude color <name> <colour>   (colours: $COLORS, or #RRGGBB)"
+    need_color "$color"
+    mkdir -p "$ROOT/.colors"
+    printf '%s' "$color" > "$ROOT/.colors/$slug"
+    make_app "$slug"
+}
+
+cmd_colors() {
+    local c hex
+    for c in $COLORS; do
+        hex=$(color_hex "$c")
+        if [ -t 1 ]; then
+            printf '\033[38;2;%d;%d;%dm●\033[0m %-8s #%s\n' \
+                "0x${hex:0:2}" "0x${hex:2:2}" "0x${hex:4:2}" "$c" "$hex"
+        else
+            printf '%-8s #%s\n' "$c" "$hex"
+        fi
+    done
+    printf '%sor any hex: mclaude color work "#FF8800"%s\n' "$DIM" "$X"
+}
+
+cmd_open() {
+    local slug claude_app pid
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    pid=$(main_pid "$slug")
+    if [ -n "$pid" ]; then
+        cmd_focus "$slug"; return
+    fi
+    claude_app=$(detect_claude_app) || die "Claude.app not found in /Applications"
+    mkdir -p "$DESKTOP_DIR/$slug"
+    /usr/bin/open -n -a "$claude_app" --args --user-data-dir="$DESKTOP_DIR/$slug"
+    ok "launched Claude Desktop ($slug)"
+}
+
+cmd_focus() {
+    local slug pid
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    pid=$(main_pid "$slug")
+    [ -n "$pid" ] || die "'$slug' is not running (mclaude open $slug)"
+    /usr/bin/osascript -e "tell application \"System Events\" to set frontmost of (first application process whose unix id is $pid) to true" >/dev/null 2>&1 \
+        || die "couldn't focus — allow Automation for your terminal in System Settings → Privacy"
+    ok "focused $slug"
+}
+
+cmd_code() {
+    local slug
+    slug=$(need_slug "${1:-}"); need_profile "$slug"; shift
+    command -v claude >/dev/null 2>&1 || die "Claude Code CLI not found (npm i -g @anthropic-ai/claude-code)"
+    mkdir -p "$CODE_DIR/$slug"
+    CLAUDE_CONFIG_DIR="$CODE_DIR/$slug" exec claude "$@"
+}
+
+cmd_quit() {
+    local slug pid force="${2:-}"
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    pid=$(main_pid "$slug")
+    [ -n "$pid" ] || { printf '%s is not running\n' "$slug"; return 0; }
+    if [ "$force" = "--force" ]; then
+        # shellcheck disable=SC2046
+        kill -9 $(tree_pids "$pid") 2>/dev/null
+        ok "force-quit $slug"
+    else
+        kill -TERM "$pid" 2>/dev/null
+        ok "quit $slug"
+    fi
+}
+
+cmd_ls() {
+    local d slug pid status cpu mem tree names=0
+    mkdir -p "$DESKTOP_DIR" "$CODE_DIR"
+    printf '%s%-16s %-22s %-10s %6s %8s%s\n' "$B" "PROFILE" "NAME" "DESKTOP" "CPU%" "MEM" "$X"
+    for d in "$DESKTOP_DIR"/* "$CODE_DIR"/*; do
+        [ -d "$d" ] || continue
+        slug=$(basename "$d")
+        case " $names " in *" $slug "*) continue ;; esac
+        names="$names $slug"
+        pid=$(main_pid "$slug")
+        if [ -n "$pid" ]; then
+            tree=$(tree_pids "$pid" | tr ' ' ',')
+            cpu=$(ps -o %cpu= -p "$tree" 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
+            mem=$(ps -o rss= -p "$tree" 2>/dev/null | awk '{s+=$1} END {printf "%.0fM", s/1024}')
+            status="${G}running${X}  "
+        else
+            cpu="-"; mem="-"; status="${DIM}stopped${X}  "
+        fi
+        printf '%-16s %-22s %s %6s %8s\n' "$slug" "$(display_name "$slug")" "$status" "$cpu" "$mem"
+    done
+    [ "$names" = "0" ] && printf '%sno profiles yet — mclaude new <Name>%s\n' "$DIM" "$X"
+    return 0
+}
+
+cmd_rm() {
+    local slug app answer
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    [ -n "$(main_pid "$slug")" ] && die "'$slug' is running — mclaude quit $slug first"
+    app=$(app_path "$slug")
+    printf '%sThis deletes profile %s and its saved logins (Desktop + Code).%s\n' "$Y" "$slug" "$X"
+    printf 'Type DELETE to confirm: '
+    read -r answer
+    [ "$answer" = "DELETE" ] || { printf 'cancelled\n'; return 0; }
+    rm -rf "${DESKTOP_DIR:?}/${slug:?}" "${CODE_DIR:?}/${slug:?}" \
+        "${ROOT:?}/.names/${slug:?}" "${ROOT:?}/.colors/${slug:?}"
+    [ -d "$app" ] && rm -rf "${app:?}"
+    ok "removed $slug"
+}
+
+cmd_app() {  # (re)create the Dock app for an existing profile
+    local slug
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    make_app "$slug"
+}
+
+cmd_alias() {  # print shell aliases: eval "$(mclaude alias)"
+    local d slug
+    for d in "$CODE_DIR"/*; do
+        [ -d "$d" ] || continue
+        slug=$(basename "$d")
+        printf "alias claude-%s='CLAUDE_CONFIG_DIR=\"%s\" claude'\n" "$slug" "$d"
+    done
+}
+
+cmd_path() {
+    local slug
+    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    printf 'desktop  %s\ncode     %s\napp      %s\n' "$DESKTOP_DIR/$slug" "$CODE_DIR/$slug" "$(app_path "$slug")"
+}
+
+usage() {
+    cat <<EOF
+${B}mclaude${X} $VERSION — multiple Claude accounts side by side
+
+${B}Usage${X}
+  mclaude new <Name> [--color c]  create a profile (+ Dock app "Claude <Name>")
+                     [--no-app]
+  mclaude ls                      list profiles, running state, CPU, memory
+  mclaude color <name> <colour>   change the Dock icon's badge colour
+  mclaude colors                  show available colours
+  mclaude open <name>             launch (or focus) that account's Claude Desktop
+  mclaude focus <name>            bring a running instance to the front
+  mclaude code <name> [args...]   run Claude Code as that account
+  mclaude quit <name> [--force]   quit an instance (--force kills its process tree)
+  mclaude app <name>              (re)create the Dock app for a profile
+  mclaude alias                   print claude-<name> aliases; eval "\$(mclaude alias)"
+  mclaude path <name>             show a profile's folders
+  mclaude rm <name>               delete a profile and its logins (asks for DELETE)
+
+Data lives in $ROOT. Your normal Claude install is never touched.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        new|create)       cmd_new "$@" ;;
+        ls|list)          cmd_ls ;;
+        open|start)       cmd_open "$@" ;;
+        focus)            cmd_focus "$@" ;;
+        code|cc)          cmd_code "$@" ;;
+        quit|stop)        cmd_quit "$@" ;;
+        app)              cmd_app "$@" ;;
+        color|colour)     cmd_color "$@" ;;
+        colors|colours)   cmd_colors ;;
+        alias)            cmd_alias ;;
+        path)             cmd_path "$@" ;;
+        rm|remove)        cmd_rm "$@" ;;
+        -v|--version)     printf '%s\n' "$VERSION" ;;
+        help|-h|--help)   usage ;;
+        *)                err "unknown command: $cmd"; usage; exit 1 ;;
+    esac
+}
+
+[ "${BASH_SOURCE[0]}" = "$0" ] && main "$@"
