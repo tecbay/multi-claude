@@ -14,10 +14,21 @@ cd multi-claude
 ./install.sh
 ```
 
-You need [Claude Desktop](https://claude.ai/download) installed. Nothing else.
+The installer asks a few quick questions and walks you through making your first profile:
 
-> If `mclaude` isn't found after installing, add this line to `~/.zshrc` and open a new terminal:
-> `export PATH="$HOME/.local/bin:$PATH"`
+```
+? Install mclaude to [~/.local/bin]
+? Add ~/.local/bin to your PATH? [Y/n]
+? Add Claude Code shortcuts (type claude-work to use the Work account)? [Y/n]
+? Create a profile now? [Y/n]
+? Profile name (e.g. Work, Personal) [Work]
+? Icon colour [blue]
+? Open Claude for Work now and sign in? [Y/n]
+```
+
+Press Enter to accept the default. To skip the questions, run `./install.sh -y`.
+
+You need [Claude Desktop](https://claude.ai/download) installed. Nothing else.
 
 ## Quick start
 
@@ -45,7 +56,7 @@ That's it. **Claude Work** is now in your Applications folder, Dock and Spotligh
 
 ## Tips
 
-- **Claude Code shortcuts:** add `eval "$(mclaude alias)"` to `~/.zshrc`. Then type `claude-work` to run Claude Code as Work.
+- **Claude Code shortcuts:** if you said yes during install, type `claude-work` to run Claude Code as Work.
 - **Login opens in the wrong window?** On the login page, choose the option to copy a code and paste it into the right window. You only need to do this once per profile.
 - **Which window is which?** Every running copy is named "Claude". Run `mclaude open <name>` to bring a specific one to the front.
 
@@ -62,6 +73,8 @@ That's it. **Claude Work** is now in your Applications folder, Dock and Spotligh
 mclaude rm <name>                 # for each profile
 rm ~/.local/bin/mclaude
 ```
+
+Then delete the lines marked `# added by multi-claude` from `~/.zshrc`.
 
 ## License
 
