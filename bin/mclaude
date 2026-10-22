@@ -9,7 +9,7 @@
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 ROOT="${MCLAUDE_HOME:-$HOME/.multi-claude}"
 DESKTOP_DIR="$ROOT/desktop"
 CODE_DIR="$ROOT/code"
@@ -27,9 +27,9 @@ LIB_DIR="$(cd "$(dirname "$SELF")/../lib" 2>/dev/null && pwd)"
 COLORS="red orange yellow green teal blue indigo purple pink gray black"
 
 if [ -t 1 ]; then
-    B=$'\033[1m'; DIM=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; X=$'\033[0m'
+    B=$'\033[1m'; DIM=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; C=$'\033[36m'; X=$'\033[0m'
 else
-    B=""; DIM=""; G=""; R=""; Y=""; X=""
+    B=""; DIM=""; G=""; R=""; Y=""; C=""; X=""
 fi
 
 err() { printf '%smclaude:%s %s\n' "$R" "$X" "$*" >&2; }
@@ -49,11 +49,7 @@ need_slug() {
     printf '%s' "$slug"
 }
 
-profile_exists() { [ -d "$DESKTOP_DIR/$1" ] || [ -d "$CODE_DIR/$1" ]; }
-
-need_profile() {
-    profile_exists "$1" || die "no profile '$1' (see: mclaude ls)"
-}
+profile_exists() { [ -n "$1" ] && { [ -d "$DESKTOP_DIR/$1" ] || [ -d "$CODE_DIR/$1" ]; }; }
 
 display_name() {  # stored at create time so "Client X" survives slugging
     local f="$ROOT/.names/$1"
@@ -84,6 +80,115 @@ profile_color() {
 
 need_color() {
     [ -n "$(color_hex "${1:-}")" ] || die "unknown colour '${1:-}' — use one of: $COLORS, or #RRGGBB"
+}
+
+# ---------------------------------------------------------------------------
+# Interactive pickers (menus go to stderr so $(...) captures only the answer)
+# ---------------------------------------------------------------------------
+
+interactive() { [ -t 0 ] && [ -t 2 ]; }
+
+dot() {  # coloured ● for a colour name/hex (plain when not a terminal)
+    local hex
+    hex=$(color_hex "$1")
+    if [ -t 2 ] && [ -n "$hex" ]; then
+        printf '\033[38;2;%d;%d;%dm●\033[0m' "0x${hex:0:2}" "0x${hex:2:2}" "0x${hex:4:2}"
+    else
+        printf '●'
+    fi
+}
+
+prompt() {  # prompt "Question" "default" → answer on stdout
+    local answer
+    if [ -n "${2:-}" ]; then
+        printf '%s?%s %s %s[%s]%s ' "$C" "$X" "$1" "$DIM" "$2" "$X" >&2
+    else
+        printf '%s?%s %s ' "$C" "$X" "$1" >&2
+    fi
+    read -r answer || exit 1
+    printf '%s' "${answer:-${2:-}}"
+}
+
+confirm() {  # confirm "Question" Y|N → status 0 for yes
+    local answer hint="Y/n"
+    [ "$2" = "N" ] && hint="y/N"
+    printf '%s?%s %s %s[%s]%s ' "$C" "$X" "$1" "$DIM" "$hint" "$X" >&2
+    read -r answer || return 1
+    case "${answer:-$2}" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+list_slugs() {
+    local d
+    for d in "$DESKTOP_DIR"/* "$CODE_DIR"/*; do
+        [ -d "$d" ] && basename "$d"
+    done | sort -u
+}
+
+# pick_profile "Question" → slug (by number or name)
+pick_profile() {
+    local slugs s i=0 answer state
+    slugs=$(list_slugs)
+    [ -n "$slugs" ] || die "no profiles yet — run: mclaude new"
+    printf '%s?%s %s\n' "$C" "$X" "$1" >&2
+    for s in $slugs; do
+        i=$((i + 1))
+        if [ -n "$(main_pid "$s")" ]; then state="${G}running${X}"; else state="${DIM}stopped${X}"; fi
+        printf '  %s%2d)%s %s %-20s %s\n' "$B" "$i" "$X" "$(dot "$(profile_color "$s")")" "$(display_name "$s")" "$state" >&2
+    done
+    while :; do
+        printf '  %s>%s ' "$C" "$X" >&2
+        read -r answer || exit 1
+        [ -n "$answer" ] || continue
+        case "$answer" in
+            *[!0-9]*) s=$(slugify "$answer") ;;
+            *)        s=$(printf '%s\n' $slugs | sed -n "${answer}p") ;;
+        esac
+        profile_exists "$s" && { printf '%s' "$s"; return 0; }
+        printf '  %snot in the list — type a number or name%s\n' "$Y" "$X" >&2
+    done
+}
+
+# pick_color "Question" [allow_auto] → colour name/hex ("" = automatic)
+pick_color() {
+    local c i=0 answer
+    printf '%s?%s %s\n' "$C" "$X" "$1" >&2
+    for c in $COLORS; do
+        i=$((i + 1))
+        printf '  %s%2d)%s %s %s\n' "$B" "$i" "$X" "$(dot "$c")" "$c" >&2
+    done
+    printf '  %sor a hex like #FF8800%s\n' "$DIM" "$X" >&2
+    while :; do
+        if [ -n "${2:-}" ]; then
+            printf '  %s>%s %s[Enter = automatic]%s ' "$C" "$X" "$DIM" "$X" >&2
+        else
+            printf '  %s>%s ' "$C" "$X" >&2
+        fi
+        read -r answer || exit 1
+        if [ -z "$answer" ]; then
+            [ -n "${2:-}" ] && return 0
+            continue
+        fi
+        case "$answer" in
+            *[!0-9]*) ;;
+            *) answer=$(printf '%s' "$COLORS" | awk -v n="$answer" '{print $n}') ;;
+        esac
+        [ -n "$(color_hex "$answer")" ] && { printf '%s' "$answer"; return 0; }
+        printf '  %snot a colour — type a number, name or #RRGGBB%s\n' "$Y" "$X" >&2
+    done
+}
+
+# profile_arg "<given>" "Question" → slug; picks interactively when missing.
+# Callers use: slug=$(profile_arg ...) || exit 1
+profile_arg() {
+    if [ -z "${1:-}" ]; then
+        interactive || die "missing profile name (see: mclaude help)"
+        pick_profile "$2"
+        return
+    fi
+    local slug
+    slug=$(slugify "$1")
+    profile_exists "$slug" || die "no profile '$1' (see: mclaude ls)"
+    printf '%s' "$slug"
 }
 
 detect_claude_app() {
@@ -141,12 +246,19 @@ cmd_new() {
         esac
         shift
     done
-    [ -n "$name" ] || die "usage: mclaude new <Name> [--color <colour>] [--no-app]"
+    local asked=0 slug
+    if [ -z "$name" ]; then
+        interactive || die "usage: mclaude new <Name> [--color <colour>] [--no-app]"
+        name=$(prompt "Profile name (e.g. Work, Personal)") || exit 1
+        asked=1
+    fi
     name=$(printf '%s' "$name" | tr -d '"\\{}:<>&/' | sed 's/^ *//;s/ *$//')
-    local slug
-    slug=$(need_slug "$name")
+    slug=$(need_slug "$name") || exit 1
     [ "$slug" = "default" ] && die "'default' is reserved — pick another name"
     profile_exists "$slug" && die "profile '$slug' already exists"
+    if [ -z "$color" ] && [ "$asked" -eq 1 ]; then
+        color=$(pick_color "Icon colour" auto) || exit 1
+    fi
 
     mkdir -p "$DESKTOP_DIR/$slug" "$CODE_DIR/$slug" "$ROOT/.names"
     printf '%s' "$name" > "$ROOT/.names/$slug"
@@ -158,6 +270,11 @@ cmd_new() {
 
     [ "$with_app" -eq 1 ] && make_app "$slug"
 
+    if [ "$asked" -eq 1 ]; then
+        printf '\n'
+        confirm "Open Claude for $name now and sign in?" Y && cmd_open "$slug"
+        return 0
+    fi
     printf '\n  Desktop:  mclaude open %s\n  Code:     mclaude code %s\n\n' "$slug" "$slug"
     printf '%sSign in once in each; it stays signed in.%s\n' "$DIM" "$X"
 }
@@ -227,9 +344,12 @@ badge_icon() {
 
 cmd_color() {  # change a profile's icon colour
     local slug color
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    slug=$(profile_arg "${1:-}" "Change the colour of which profile?") || exit 1
     color="${2:-}"
-    [ -n "$color" ] || die "usage: mclaude color <name> <colour>   (colours: $COLORS, or #RRGGBB)"
+    if [ -z "$color" ]; then
+        interactive || die "usage: mclaude color <name> <colour>   (colours: $COLORS, or #RRGGBB)"
+        color=$(pick_color "New colour for $(display_name "$slug")") || exit 1
+    fi
     need_color "$color"
     mkdir -p "$ROOT/.colors"
     printf '%s' "$color" > "$ROOT/.colors/$slug"
@@ -252,7 +372,7 @@ cmd_colors() {
 
 cmd_open() {
     local slug claude_app pid
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    slug=$(profile_arg "${1:-}" "Open which profile?") || exit 1
     pid=$(main_pid "$slug")
     if [ -n "$pid" ]; then
         cmd_focus "$slug"; return
@@ -265,7 +385,7 @@ cmd_open() {
 
 cmd_focus() {
     local slug pid
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    slug=$(profile_arg "${1:-}" "Bring which profile to the front?") || exit 1
     pid=$(main_pid "$slug")
     [ -n "$pid" ] || die "'$slug' is not running (mclaude open $slug)"
     /usr/bin/osascript -e "tell application \"System Events\" to set frontmost of (first application process whose unix id is $pid) to true" >/dev/null 2>&1 \
@@ -275,7 +395,8 @@ cmd_focus() {
 
 cmd_code() {
     local slug
-    slug=$(need_slug "${1:-}"); need_profile "$slug"; shift
+    slug=$(profile_arg "${1:-}" "Run Claude Code as which profile?") || exit 1
+    [ $# -gt 0 ] && shift
     command -v claude >/dev/null 2>&1 || die "Claude Code CLI not found (npm i -g @anthropic-ai/claude-code)"
     mkdir -p "$CODE_DIR/$slug"
     CLAUDE_CONFIG_DIR="$CODE_DIR/$slug" exec claude "$@"
@@ -283,7 +404,8 @@ cmd_code() {
 
 cmd_quit() {
     local slug pid force="${2:-}"
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    [ "${1:-}" = "--force" ] && { force="--force"; shift; }
+    slug=$(profile_arg "${1:-}" "Quit which profile?") || exit 1
     pid=$(main_pid "$slug")
     [ -n "$pid" ] || { printf '%s is not running\n' "$slug"; return 0; }
     if [ "$force" = "--force" ]; then
@@ -322,7 +444,7 @@ cmd_ls() {
 
 cmd_rm() {
     local slug app answer
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    slug=$(profile_arg "${1:-}" "Delete which profile?") || exit 1
     [ -n "$(main_pid "$slug")" ] && die "'$slug' is running — mclaude quit $slug first"
     app=$(app_path "$slug")
     printf '%sThis deletes profile %s and its saved logins (Desktop + Code).%s\n' "$Y" "$slug" "$X"
@@ -337,7 +459,7 @@ cmd_rm() {
 
 cmd_app() {  # (re)create the Dock app for an existing profile
     local slug
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    slug=$(profile_arg "${1:-}" "Rebuild the Dock app for which profile?") || exit 1
     make_app "$slug"
 }
 
@@ -352,8 +474,39 @@ cmd_alias() {  # print shell aliases: eval "$(mclaude alias)"
 
 cmd_path() {
     local slug
-    slug=$(need_slug "${1:-}"); need_profile "$slug"
+    slug=$(profile_arg "${1:-}" "Show folders for which profile?") || exit 1
     printf 'desktop  %s\ncode     %s\napp      %s\n' "$DESKTOP_DIR/$slug" "$CODE_DIR/$slug" "$(app_path "$slug")"
+}
+
+cmd_menu() {  # what you get from a bare `mclaude` in a terminal
+    local choice
+    printf '%smulti-claude%s %s\n\n' "$B" "$X" "$VERSION"
+    if [ -n "$(list_slugs)" ]; then cmd_ls; printf '\n'; fi
+    printf '%s?%s What do you want to do?\n' "$C" "$X"
+    printf '  %s1)%s Open Claude Desktop\n'      "$B" "$X"
+    printf '  %s2)%s Run Claude Code\n'          "$B" "$X"
+    printf '  %s3)%s New profile\n'              "$B" "$X"
+    printf '  %s4)%s Change icon colour\n'       "$B" "$X"
+    printf '  %s5)%s Quit a profile\n'           "$B" "$X"
+    printf '  %s6)%s Delete a profile\n'         "$B" "$X"
+    printf '  %s7)%s Help (all commands)\n'      "$B" "$X"
+    printf '  %s0)%s Exit\n'                     "$B" "$X"
+    while :; do
+        printf '  %s>%s ' "$C" "$X"
+        read -r choice || exit 0
+        printf '\n'
+        case "$choice" in
+            1) cmd_open; return ;;
+            2) cmd_code; return ;;
+            3) cmd_new; return ;;
+            4) cmd_color; return ;;
+            5) cmd_quit; return ;;
+            6) cmd_rm; return ;;
+            7) usage; return ;;
+            0|q|"") return 0 ;;
+            *) printf '  %spick 0–7%s\n' "$Y" "$X" ;;
+        esac
+    done
 }
 
 usage() {
@@ -361,6 +514,7 @@ usage() {
 ${B}mclaude${X} $VERSION — multiple Claude accounts side by side
 
 ${B}Usage${X}
+  mclaude                         interactive menu
   mclaude new <Name> [--color c]  create a profile (+ Dock app "Claude <Name>")
                      [--no-app]
   mclaude ls                      list profiles, running state, CPU, memory
@@ -375,6 +529,7 @@ ${B}Usage${X}
   mclaude path <name>             show a profile's folders
   mclaude rm <name>               delete a profile and its logins (asks for DELETE)
 
+Leave out <name> or <colour> and mclaude asks you to pick from a list.
 Data lives in $ROOT. Your normal Claude install is never touched.
 EOF
 }
@@ -382,8 +537,12 @@ EOF
 # ---------------------------------------------------------------------------
 
 main() {
-    local cmd="${1:-help}"
+    local cmd="${1:-}"
     [ $# -gt 0 ] && shift
+    if [ -z "$cmd" ]; then
+        if interactive; then cmd_menu; else usage; fi
+        return
+    fi
     case "$cmd" in
         new|create)       cmd_new "$@" ;;
         ls|list)          cmd_ls ;;

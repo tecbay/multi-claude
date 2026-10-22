@@ -32,17 +32,35 @@ You need [Claude Desktop](https://claude.ai/download) installed. Nothing else.
 
 ## Quick start
 
+Just type:
+
 ```bash
-mclaude new Work --color blue     # make a profile called "Work"
-mclaude open work                 # open Claude Desktop for it, then sign in
+mclaude
 ```
 
-That's it. **Claude Work** is now in your Applications folder, Dock and Spotlight. Sign in once and it stays signed in.
+You'll get a menu:
+
+```
+? What do you want to do?
+  1) Open Claude Desktop
+  2) Run Claude Code
+  3) New profile
+  4) Change icon colour
+  5) Quit a profile
+  6) Delete a profile
+  7) Help (all commands)
+  0) Exit
+```
+
+Pick **3** to make a profile. You'll be asked for a name and a colour, and then you sign in. **Claude Work** is now in your Applications folder, Dock and Spotlight, and it stays signed in.
 
 ## Commands
 
+Prefer typing? Every menu item is also a command. If you leave out the name or colour, `mclaude` asks you to pick from a list.
+
 | Command | What it does |
 |---|---|
+| `mclaude` | Open the menu |
 | `mclaude new <Name> --color <colour>` | Create a profile |
 | `mclaude open <name>` | Open Claude Desktop for that account |
 | `mclaude code <name>` | Run Claude Code as that account |
