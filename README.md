@@ -63,6 +63,10 @@ mclaude rm <name>                 # for each profile
 rm ~/.local/bin/mclaude
 ```
 
+## License
+
+[MIT](LICENSE). Free to use, change and share.
+
 ---
 
 Unofficial project, not made by Anthropic. Inspired by [jyito/Claude-Profiles](https://github.com/jyito/Claude-Profiles).
